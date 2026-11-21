@@ -121,6 +121,7 @@ module.exports = async function handler(req, res) {
         body: JSON.stringify({
           systemInstruction: { parts: [{ text: systemText }] },
           contents: contents,
+generationConfig: { thinkingConfig: { thinkingLevel: "MINIMAL" } },
         }),
       }
     );
