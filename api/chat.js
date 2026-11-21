@@ -2,7 +2,7 @@
 // This runs on the SERVER (Vercel), not in the browser.
 // That is why the API key stays safe: visitors never see this file or the key.
 
-const MODEL = "gemini-2.5-flash"; // if this name stops working, check Google AI Studio for the current one
+const MODEL = "gemini-3.5-flash"; // if this name stops working, check Google AI Studio for the current one
 
 // STEP A: Paste your Version 2 system prompt between the backticks, replacing the example below.
 const SYSTEM_PROMPT = `
