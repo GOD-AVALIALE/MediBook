@@ -4,6 +4,9 @@
 // If one model is busy or fails, the server automatically tries the next one.
 const MODELS = ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-3-flash-preview"];
 
+// Shown by the status check (open /api/chat in the browser) so you can confirm which version is live.
+const VERSION = "2026-11-23-d";
+
 // Patients can book today, tomorrow and the day after (3 days in total).
 const DAYS_AHEAD = 3;
 
@@ -43,6 +46,8 @@ Rules:
 const LIVE_RULES = `
 Booking, cancelling and rescheduling:
 - Patients can book only for the three days listed above. If they ask for another day, say only these days can be booked.
+- If the patient writes a listed time loosely (for example "10 AM" or "10-00 am"), treat it as that listed slot and pass the time exactly as listed (for example 10:00 AM).
+- Every slot listed under a day is free right now. Never say a day has no slots unless the list for that day says "no free slots". If the patient wants today at a later time, offer today's listed slots that are later than the time they ask for or than their current booking.
 - Offer only free slots from the live list, for the patient's doctor and chosen day. Never invent a doctor, day or time. If that doctor has no free slot on that day, offer another day or another doctor.
 - To book: when you have the name, reason, doctor, day and slot, call book_slot (date as YYYY-MM-DD from the date codes above, time exactly as listed). Do not say it is booked until the tool returns status "booked".
 - To cancel: ask for the patient's name, call find_bookings, and make sure which booking they mean. Ask "Do you want me to cancel it?" and only after a clear yes, call cancel_booking.
@@ -114,6 +119,7 @@ function istNow() {
   const [h, m] = hm.split(":").map(Number);
   return { today, minutes: (h % 24) * 60 + m };
 }
+const clock = (m) => { const h = Math.floor(m / 60) % 24; return ((h % 12) || 12) + ":" + String(m % 60).padStart(2, "0") + (h >= 12 ? " PM" : " AM"); };
 function bookableDates() {
   const { today } = istNow();
   const names = ["Today", "Tomorrow", "Day after tomorrow"];
@@ -132,7 +138,20 @@ function slotMinutes(t) {
 }
 const dayKey = (iso) => "slots:" + iso;
 const norm = (s) => String(s || "").toLowerCase().replace(/[^a-z0-9]/g, "");
-const normTime = (s) => String(s || "").toUpperCase().replace(/\s+/g, "");
+// Understands loose times such as "10 AM", "10am", "10-00 AM", "10.00", "3 pm" or "15:00"
+// and returns the matching slot of that doctor (for example "10:00 AM"), or null.
+function matchSlot(doc, input) {
+  const t = String(input || "").toLowerCase().replace(/([ap])\.?m\.?/g, "$1m").replace(/\./g, ":").replace(/[-_]/g, ":").replace(/\s+/g, " ").trim();
+  const m = /^(\d{1,2})(?::?(\d{2}))?\s*(am|pm)?$/.exec(t.replace(/:+/g, ":").replace(/:(am|pm)$/, " $1").replace(/ ?(a|p)m$/, " $1m").replace(/\s+(am|pm)$/, "$1"));
+  if (!m) return null;
+  const h = +m[1], min = +(m[2] || 0), ap = m[3];
+  if (h > 23 || min > 59) return null;
+  let targets;
+  if (ap) targets = [(h % 12 + (ap === "pm" ? 12 : 0)) * 60 + min];
+  else if (h >= 13 || h === 0) targets = [h * 60 + min];
+  else targets = [(h % 12) * 60 + min, (h % 12 + 12) * 60 + min]; // no am/pm given: try both
+  return doc.slots.find((slot) => targets.includes(slotMinutes(slot))) || null;
+}
 const cleanName = (s) => { const n = String(s || "").trim(); return /^[A-Za-z ]{2,60}$/.test(n) ? n : null; };
 const parseHash = (raw) => {
   if (Array.isArray(raw)) { const o = {}; for (let i = 0; i + 1 < raw.length; i += 2) o[raw[i]] = raw[i + 1]; return o; }
@@ -148,8 +167,8 @@ function checkSlot(dateIso, doctor, time, allowPast) {
   const q = norm(doctor);
   const doc = q && DOCTORS.find((d) => norm(d.name).includes(q) || q.includes(norm(d.name)));
   if (!doc) return { err: { status: "invalid_doctor", message: "No such doctor. Use a doctor from the list." } };
-  const slot = doc.slots.find((t) => normTime(t) === normTime(time));
-  if (!slot) return { err: { status: "invalid_slot", message: "That time is not one of this doctor's slots." } };
+  const slot = matchSlot(doc, time);
+  if (!slot) return { err: { status: "invalid_slot", message: "That time is not one of this doctor's slots.", valid_times: doc.slots } };
   const { today, minutes } = istNow();
   if (!allowPast && date.iso === today && slotMinutes(slot) <= minutes) return { err: { status: "invalid_slot", message: "That time has already passed today." } };
   return { doc, slot, date };
@@ -278,6 +297,17 @@ async function askModel(model, apiKey, systemText, contents, useTools) {
 }
 
 module.exports = async function handler(req, res) {
+  // Open /api/chat in the browser to check the version and the database connection.
+  if (req.method === "GET") {
+    let db = "not set up (UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN missing)";
+    if (REDIS_URL && REDIS_TOKEN) {
+      try { await redis(["PING"]); db = "connected"; } catch (e) { db = "set up but not reachable"; }
+    }
+    let free = null;
+    if (db === "connected") { try { free = (await getFreeSlots()).map((d) => ({ day: d.label, free_slots: d.doctors })); } catch (e) {} }
+    const t = istNow();
+    return res.status(200).json({ version: VERSION, database: db, gemini_key_set: Boolean(process.env.GEMINI_API_KEY), server_time_india: clock(t.minutes), today: t.today, days: free });
+  }
   if (req.method !== "POST") return res.status(405).json({ error: "Use POST" });
 
   const apiKey = process.env.GEMINI_API_KEY;
@@ -303,7 +333,7 @@ module.exports = async function handler(req, res) {
     days = bookableDates().map((d) => ({ iso: d.iso, label: d.label, doctors: Object.fromEntries(DOCTORS.map((doc) => [doc.name, doc.slots.filter((t) => !(d.iso === today && slotMinutes(t) <= minutes))])) }));
   }
 
-  const slotBlock = "\n" + (live ? "FREE SLOTS RIGHT NOW (live list; booked and past slots are already removed). Date codes are in brackets." : "SLOTS (not live).") + "\n" +
+  const slotBlock = "\nNOW: " + clock(istNow().minutes) + " India time.\n" + (live ? "FREE SLOTS RIGHT NOW (live list; booked and past slots are already removed). Date codes are in brackets." : "SLOTS (not live).") + "\n" +
     days.map((d) => `== ${d.label} [${d.iso}] ==\n` + DOCTORS.map((doc) => `${doc.name} (${doc.dept}): ${d.doctors[doc.name].length ? d.doctors[doc.name].join(", ") : "no free slots"}`).join("\n")).join("\n") + "\n";
   const safeRecords = Array.isArray(records) ? records.slice(0, 20) : [];
   const systemText = SYSTEM_PROMPT + slotBlock + (live ? LIVE_RULES : OFFLINE_RULES) + "\n" + RECORDS_RULES + "\nPATIENT RECORDS:\n" + JSON.stringify(safeRecords);
